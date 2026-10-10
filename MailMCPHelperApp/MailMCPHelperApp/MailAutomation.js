@@ -151,15 +151,10 @@ function messageToJson(account, mailbox, pathSegments, message, options) {
 }
 
 function resolveMessage(account, mailbox, messageId) {
-  const targetMessageId = Number(messageId);
+  // Direct id lookup is one Apple Event; iterating every message is one per message.
+  const message = mailbox.messages.byId(Number(messageId));
 
-  for (const message of safeList(() => mailbox.messages())) {
-    if (Number(safeCall(() => message.id(), -1)) === targetMessageId) {
-      return message;
-    }
-  }
-
-  return null;
+  return safeCall(() => (message.id(), message), null);
 }
 
 function recipientProperties(input) {
@@ -246,7 +241,6 @@ function applyDraftEdits(mail, message, input) {
 function mailboxToJson(account, mailbox, pathSegments) {
   const children = safeList(() => mailbox.mailboxes());
   const name = String(mailbox.name());
-  const messages = safeList(() => mailbox.messages());
 
   return {
     accountId: String(account.id()),
@@ -255,7 +249,7 @@ function mailboxToJson(account, mailbox, pathSegments) {
     path: buildPath(pathSegments),
     pathSegments,
     unreadCount: toNumber(safeCall(() => mailbox.unreadCount(), 0), 0),
-    messageCount: messages.length,
+    messageCount: toNumber(safeCall(() => mailbox.messages.length, 0), 0),
     childCount: children.length,
     isInbox: isInboxName(name),
   };
@@ -279,16 +273,19 @@ function walkMailboxes(account, mailboxes, pathSegments, output) {
 }
 
 function resolveMailbox(account, pathSegments) {
-  let children = safeList(() => account.mailboxes());
+  let children = account.mailboxes;
   let mailbox = null;
 
   for (const segment of pathSegments) {
-    mailbox = children.find((candidate) => String(candidate.name()) === String(segment));
-    if (!mailbox) {
+    // Fetch all sibling names in one Apple Event; per-mailbox name() calls take
+    // seconds on accounts with hundreds of top-level folders.
+    const index = safeList(() => children.name()).map(String).indexOf(String(segment));
+    if (index === -1) {
       throw new Error("No Mail mailbox matched the requested path.");
     }
 
-    children = safeList(() => mailbox.mailboxes());
+    mailbox = children[index];
+    children = mailbox.mailboxes;
   }
 
   if (!mailbox) {
@@ -360,15 +357,17 @@ function listInboxMessages(mail, input) {
       continue;
     }
 
-    const mailboxes = [];
-    walkMailboxes(account, safeList(() => account.mailboxes()), [], mailboxes);
+    // Inboxes are top-level, so fetch top-level names in one Apple Event instead of
+    // walking every mailbox (minutes on accounts with thousands of folders).
+    const topLevelNames = safeList(() => account.mailboxes.name()).map(String);
 
-    for (const mailboxInfo of mailboxes) {
-      if (!mailboxInfo.isInbox) {
+    for (const [index, name] of topLevelNames.entries()) {
+      if (!isInboxName(name)) {
         continue;
       }
 
-      const mailbox = resolveMailbox(account, mailboxInfo.pathSegments);
+      const mailbox = account.mailboxes[index];
+      const pathSegments = [name];
       const limit =
         input.limitPerInbox === null || input.limitPerInbox === undefined
           ? null
@@ -380,7 +379,7 @@ function listInboxMessages(mail, input) {
           continue;
         }
 
-        output.push(messageToJson(account, mailbox, mailboxInfo.pathSegments, message, input));
+        output.push(messageToJson(account, mailbox, pathSegments, message, input));
         count += 1;
 
         if (limit !== null && count >= limit) {
